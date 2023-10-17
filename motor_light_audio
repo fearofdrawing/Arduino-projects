@@ -1,0 +1,260 @@
+// Switching between predefined scenography stages of a conceptual art exhibition, 
+// consisting of 5 consequential audio tracks, 2 different lighting scenes and moving display elements,
+// all repeating in a constant loop
+
+lighting and audio 
+#include <AccelStepper.h>
+#include <SPI.h>
+#include <SdFat.h>
+#include <SFEMP3Shield.h>
+
+#define LED_PIN_0 5
+#define LED_PIN_1 44
+#define LED_PIN_2 45
+#define LED_PIN_3 46
+
+
+#define STEP_PIN 11
+#define DIR_PIN 10
+#define RELAY_PIN_1 54
+#define RELAY_PIN_2 55
+
+#define MAX_BRIGHTNESS_0 255
+#define MAX_BRIGHTNESS_1 255
+#define MAX_BRIGHTNESS_2 255
+#define MAX_BRIGHTNESS_3 255
+#define MIN_BRIGHTNESS 0
+#define BRIGHTNESS_STEP 2
+#define FADE_DURATION 6000
+#define ADJUSTMENTS 200
+
+// cycle counter, determining the moment to reset
+int counter = 0;
+int brightness = MIN_BRIGHTNESS;
+
+int trackNr = 1;
+uint8_t volume = 1;
+
+// a flag to determine whether the audio track has finished playing ('true' indicates that the track has been played)
+bool audioPlayed = false;
+unsigned long trackStartTime = 0;
+unsigned long trackLength = 90000;
+
+AccelStepper stepper(AccelStepper::DRIVER, STEP_PIN, DIR_PIN);
+float desiredSpeed = 1000;
+
+// the duration of one step-and-pause cycle of the stepper motor
+const unsigned long stepperInterval = 1500;
+unsigned long lastStepperTime = 0;
+
+// a flag to determine the change of states ('true' means a switch to the MOTOR state)
+bool motorSwitch = true;
+unsigned long motorStartTime = 0;
+
+// the preferred duration of the MOTOR state
+unsigned long fixedStateDuration = 180000;
+
+SdFat sd;
+SFEMP3Shield MP3player;
+
+enum State {
+  MOTOR,
+  AUDIO
+};
+
+State currentState = MOTOR;
+
+void setup() {
+
+  //Serial.begin(115200);
+
+  stepper.setMaxSpeed(desiredSpeed);
+  stepper.setAcceleration(200.0);
+
+  //start the shield (QUARTER / HALF / FULL _SPEED)
+  if(!sd.begin(SD_SEL, SPI_FULL_SPEED)) sd.initErrorHalt();
+
+  //ensure that root is the active directory
+  if(!sd.chdir("/")) sd.errorHalt("sd.chdir");
+
+  MP3player.begin();
+
+  //Serial.println(F(" [+ or -] to change volume"));
+
+  pinMode(RELAY_PIN_1, OUTPUT);
+  pinMode(RELAY_PIN_2, OUTPUT);
+}
+
+void loop() {
+
+  switch (currentState) {
+
+    case MOTOR:
+      // after the LEDs have dimmed out, switch on the relays and start the motor
+      if(brightness <= MIN_BRIGHTNESS) {
+        toggleRelayOff(RELAY_PIN_1);
+        toggleRelayOff(RELAY_PIN_2);
+        runMotor();
+      }
+      switchLedOff(LED_PIN_0, brightness);
+      switchLedOff(LED_PIN_1, brightness);
+      switchLedOff(LED_PIN_2, brightness);
+      switchLedOff(LED_PIN_3, brightness);
+      // keeping track of the preferred duration of the MOTOR state
+      if(millis() - motorStartTime >= fixedStateDuration) {
+      motorSwitch = false;
+      }
+      break;
+
+    case AUDIO:
+      // switch off the relays, LEDs on, start playing the audio track
+      toggleRelayOn(RELAY_PIN_1);
+      toggleRelayOn(RELAY_PIN_2);
+      switchLedOn(LED_PIN_0, brightness, MAX_BRIGHTNESS_0);
+      switchLedOn(LED_PIN_1, brightness, MAX_BRIGHTNESS_1);
+      switchLedOn(LED_PIN_2, brightness, MAX_BRIGHTNESS_2);
+      switchLedOn(LED_PIN_3, brightness, MAX_BRIGHTNESS_3);
+      playAudio(trackNr);
+      // making available the the volume adjustment functionality
+      /*
+      if(Serial.available()) {
+        byte keyCommand = Serial.read();
+        adjustVolume(keyCommand);
+       
+      }
+      */
+      if (millis() - trackStartTime >= trackLength) {
+        MP3player.end();
+        performReset();
+      }
+
+      // cycle through the 5 available audio tracks, one at a time, in the order that they appear on the SD card
+      if(!MP3player.isPlaying()) {
+        trackNr++;     
+      if(trackNr > 5) {
+        trackNr = 1;
+      }
+      motorSwitch = true;
+      motorStartTime = millis();
+      audioPlayed = false;
+      MP3player.stopTrack();
+
+      // 'counter' value indicates how many tracks have been played (5 for the entire playlist in the given case); 
+      // resetting the microcontroller in order to enhance the stability of the system
+      if(counter >= 5) {
+        performReset();
+      }
+      
+      }
+      
+      break;
+
+    default:
+      // default state, do nothing
+      break;
+  }
+
+  // the logic of switching between the states
+  if(motorSwitch) {
+    currentState = MOTOR;
+  } else {
+        currentState = AUDIO;
+      }
+    
+
+}
+
+
+void runMotor() {
+  unsigned long currentMillis = millis();
+    // checking if the steeper motion has not yet exceeded the desired duration
+    if(currentMillis - lastStepperTime >= stepperInterval) {
+    lastStepperTime = currentMillis;
+    // 53 is the amount of steps that should be taken per second to cover 360 degree rotation within a minute approximately 
+    // (3200 steps for full rotation as set by the stepper motor driver / 60 seconds = 53.3(3) steps per second)
+    stepper.move(53);
+    stepper.runToPosition();
+    
+    }
+}
+
+void switchLedOff(int LED_PIN, int &brightness){
+  if (brightness <= MIN_BRIGHTNESS) {
+    brightness = MIN_BRIGHTNESS;
+  } else {
+    brightness -= BRIGHTNESS_STEP;
+  }
+  analogWrite(LED_PIN, brightness);
+}
+
+void switchLedOn(int LED_PIN, int &currentBrightness, int targetBrightness) {
+  int startBrightness = currentBrightness;
+  int brightnessDifference = targetBrightness - startBrightness;
+  float brightnessStep = (float)brightnessDifference / ADJUSTMENTS;
+  int interval = (FADE_DURATION / ADJUSTMENTS);
+
+  for (int i = 0; i < ADJUSTMENTS; i++) {
+    currentBrightness = startBrightness + (brightnessStep * i);
+    analogWrite(LED_PIN, currentBrightness);
+
+    if (currentBrightness == targetBrightness && !motorSwitch) {
+      currentBrightness == targetBrightness;
+    }
+  }
+}
+
+void playAudio(int trackNr) {
+  if(!audioPlayed && !MP3player.isPlaying()) {
+    MP3player.setVolume(volume, volume);
+    MP3player.playTrack(trackNr);
+    trackStartTime = millis();
+    // introduced the flag in order to avoid playing the same track multiple times in a row
+    audioPlayed = true;
+    counter++;
+  }
+}
+
+void toggleRelayOn(int relayPin) {
+  digitalWrite(relayPin, HIGH);
+}
+
+void toggleRelayOff(int relayPin) {
+  digitalWrite(relayPin, LOW);
+}
+
+// use keyboard keys '+' or '-' to adjust the audio playback volume
+/*
+void adjustVolume(byte keyCommand) {
+  if((keyCommand == '-') || (keyCommand == '+')) {
+      union twobyte {
+        uint16_t word;
+        uint8_t byte[2];
+      } mp3_vol;
+      mp3_vol.word = MP3player.getVolume();
+
+    if(keyCommand == '-') {
+      if(mp3_vol.byte[1] >= 254) {
+        mp3_vol.byte[1] = 254;
+      } else {
+        mp3_vol.byte[1] += 2;
+      }
+    } else {
+      if(mp3_vol.byte[1] <= 2) {
+        mp3_vol.byte[1] = 2;
+      } else {
+        mp3_vol.byte[1] -= 2;
+      }
+    }
+
+    MP3player.setVolume(mp3_vol.byte[1], mp3_vol.byte[1]);
+    Serial.print(F("Volume changed to -"));
+    Serial.print(mp3_vol.byte[1]>>1, 1);
+    Serial.println(F("[dB]"));
+  }
+}
+*/
+
+// trigger a restart of the microcontroller's program execution from the beginning, using the 'jump to address 0' instruction
+void performReset() {
+  asm volatile(" jmp 0");
+}
